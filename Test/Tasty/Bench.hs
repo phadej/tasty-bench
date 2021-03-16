@@ -602,6 +602,7 @@ data Measurement = Measurement
   { measTime   :: !Word64 -- ^ time in picoseconds
   , measAllocs :: !Word64 -- ^ allocations in bytes
   , measCopied :: !Word64 -- ^ copied bytes
+  , measGcFrac :: !Word64 -- ^ percentage of time spent by GC
   } deriving (Show, Read)
 
 data Estimate = Estimate
@@ -623,7 +624,8 @@ prettyEstimateWithGC :: Estimate -> String
 prettyEstimateWithGC (Estimate m stdev) =
   showPicos (measTime m) ++ " ± " ++ showPicos (2 * stdev)
   ++ ", " ++ showBytes (measAllocs m) ++ " allocated, "
-  ++ showBytes (measCopied m) ++ " copied"
+  ++ showBytes (measCopied m) ++ " copied, "
+  ++ show (measGcFrac m) ++ "% time spent in GC"
 
 csvEstimate :: Estimate -> String
 csvEstimate (Estimate m stdev) = show (measTime m) ++ "," ++ show (2 * stdev)
@@ -636,8 +638,8 @@ predict
   :: Measurement -- ^ time for one run
   -> Measurement -- ^ time for two runs
   -> Estimate
-predict (Measurement t1 a1 c1) (Measurement t2 a2 c2) = Estimate
-  { estMean  = Measurement t (fit a1 a2) (fit c1 c2)
+predict (Measurement t1 a1 c1 g1) (Measurement t2 a2 c2 g2) = Estimate
+  { estMean  = Measurement t (fit a1 a2) (fit c1 c2) (fit g1 g2)
   , estStdev = truncate (sqrt d :: Double)
   }
   where
@@ -668,30 +670,46 @@ getRTSStatsEnabled = pure False
 #endif
 #endif
 
-getAllocsAndCopied :: IO (Word64, Word64)
+getAllocsAndCopied :: IO (Word64, Word64, Word64, Word64)
 getAllocsAndCopied = do
   enabled <- getRTSStatsEnabled
-  if not enabled then pure (0, 0) else
+  if not enabled then pure (0, 0, 0, 0) else do
 #if MIN_VERSION_base(4,10,0)
-    (\s -> (allocated_bytes s, copied_bytes s)) <$> getRTSStats
+    s <- getRTSStats
+    pure
+      ( allocated_bytes s
+      , copied_bytes s
+      , fromIntegral $ mutator_cpu_ns s
+      , fromIntegral $ gc_cpu_ns s
+      )
 #elif MIN_VERSION_base(4,6,0)
-    (\s -> (fromIntegral $ bytesAllocated s, fromIntegral $ bytesCopied s)) <$> getGCStats
+    s <- getRTSStats
+    pure
+      ( fromIntegral $ bytesAllocated s
+      , fromIntegral $ bytesCopied s
+      , truncate $ 1e9 * mutatorCpuSeconds s
+      , truncate $ 1e9 * gcCpuSeconds s
+      )
 #else
-    pure (0, 0)
+    pure (0, 0, 0, 0)
 #endif
 
 measureTime :: Int64 -> Benchmarkable -> IO Measurement
 measureTime n (Benchmarkable act) = do
   performGC
   startTime <- fromInteger <$> getCPUTime
-  (startAllocs, startCopied) <- getAllocsAndCopied
+  (startAllocs, startCopied, startMutTime, startGcTime) <- getAllocsAndCopied
   act n
   endTime <- fromInteger <$> getCPUTime
-  (endAllocs, endCopied) <- getAllocsAndCopied
+  (endAllocs, endCopied, endMutTime, endGcTime) <- getAllocsAndCopied
+  let deltaGcTime = endGcTime - startGcTime
+      deltaMutAndGcTime = deltaGcTime + (endMutTime - startMutTime)
   pure $ Measurement
     { measTime   = endTime - startTime
     , measAllocs = endAllocs - startAllocs
     , measCopied = endCopied - startCopied
+    , measGcFrac = if deltaMutAndGcTime == 0 then 0
+                   else (100 * deltaGcTime) `quot` deltaMutAndGcTime
     }
 
 measureTimeUntil :: Timeout -> RelStDev -> Benchmarkable -> IO Estimate
@@ -703,7 +721,7 @@ measureTimeUntil timeout (RelStDev targetRelStDev) b = do
     go n t1 sumOfTs = do
       t2 <- measureTime (2 * n) b
 
-      let Estimate (Measurement meanN allocN copiedN) stdevN = predictPerturbed t1 t2
+      let Estimate (Measurement meanN allocN copiedN gcFrac) stdevN = predictPerturbed t1 t2
           isTimeoutSoon = case timeout of
             NoTimeout -> False
             -- multiplying by 12/10 helps to avoid accidental timeouts
@@ -712,7 +730,7 @@ measureTimeUntil timeout (RelStDev targetRelStDev) b = do
           scale = (`quot` fromIntegral n)
 
       if isStDevInTargetRange || isTimeoutSoon
-        then pure $ Estimate (Measurement (scale meanN) (scale allocN) (scale copiedN)) (scale stdevN)
+        then pure $ Estimate (Measurement (scale meanN) (scale allocN) (scale copiedN) gcFrac) (scale stdevN)
         else go (2 * n) t2 (sumOfTs + measTime t1)
 
 instance IsTest Benchmarkable where
