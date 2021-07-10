@@ -9,3 +9,15 @@ steps:
     - apt-get install -y ghc cabal-install
     - cabal update
     - cabal new-build
+---
+kind: pipeline
+name: arm
+platform: { os: linux, arch: arm }
+steps:
+- name: Test
+  image: buildpack-deps:focal
+  commands:
+    - apt-get update -y
+    - apt-get install -y ghc cabal-install
+    - cabal update
+    - cabal new-build
