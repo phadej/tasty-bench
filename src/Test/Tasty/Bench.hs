@@ -658,6 +658,10 @@ import System.IO.Unsafe
 import System.Mem
 import Text.Printf
 
+#ifdef MIN_VERSION_libperf
+import LibPerf
+#endif
+
 #ifdef DEBUG
 import Debug.Trace
 #endif
@@ -750,6 +754,11 @@ data TimeMode = CpuTime
   -- ^ Measure wall-clock time. This requires @tasty-1.2.2@, so if you use 'WallTime'
   -- it is prudent to add @tasty >= 1.2.2@ to @build-depends@
   -- section of your cabal file.
+
+#ifdef MIN_VERSION_libperf
+  | CpuCycles
+  | Instructions
+#endif
 #endif
 #endif
   deriving (Typeable)
@@ -815,6 +824,10 @@ instance IsOption TimeMode where
     "cpu" -> Just CpuTime
 #if MIN_VERSION_tasty(1,2,2)
     "wall" -> Just WallTime
+#ifdef MIN_VERSION_libperf
+    "cycles" ->  Just CpuCycles
+    "instructions" -> Just Instructions
+#endif
 #endif
     _ -> Nothing
   optionName = pure "time-mode"
@@ -824,6 +837,10 @@ instance IsOption TimeMode where
     CpuTime -> "cpu"
 #if MIN_VERSION_tasty(1,2,2)
     WallTime -> "wall"
+#ifdef MIN_VERSION_libperf
+    CpuCycles -> "cycles"
+    Instructions -> "instructions"
+#endif
 #endif
 #endif
 #endif
@@ -970,15 +987,26 @@ predict (Measurement t1 a1 c1 m1) (Measurement t2 a2 c2 m2) = Estimate
     d = sqr (word64ToDouble t1 -     word64ToDouble t)
       + sqr (word64ToDouble t2 - 2 * word64ToDouble t)
 
-predictPerturbed :: Measurement -> Measurement -> Estimate
-predictPerturbed t1 t2 = Estimate
+predictPerturbed :: TimeMode -> Measurement -> Measurement -> Estimate
+predictPerturbed timeMode t1 t2 = Estimate
   { estMean = estMean (predict t1 t2)
   , estStdev = max
     (estStdev (predict (lo t1) (hi t2)))
     (estStdev (predict (hi t1) (lo t2)))
   }
   where
-    prec = max (fromInteger cpuTimePrecision) 1000000000 -- 1 ms
+    prec = case timeMode of
+        CpuTime -> max (fromInteger cpuTimePrecision) 1000000000 -- 1 ms
+#ifdef MIN_VERSION_tasty
+#if MIN_VERSION_tasty(1,2,2)
+        WallTime -> max (fromInteger cpuTimePrecision) 1000000000 -- 1 ms
+#endif
+#ifdef MIN_VERSION_libperf
+        CpuCycles -> 1
+        Instructions -> 1
+#endif
+#endif
+        
     hi meas = meas { measTime = measTime meas + prec }
     lo meas = meas { measTime = measTime meas - prec }
 
@@ -1002,26 +1030,46 @@ getAllocsAndCopied = do
     pure (0, 0, 0)
 #endif
 
-getTimePicoSecs :: TimeMode -> IO Word64
-getTimePicoSecs timeMode = case timeMode of
-  CpuTime -> fromInteger <$> getCPUTime
+measureTime :: TimeMode -> IO () -> IO Word64
+measureTime CpuTime action = do
+  startTime <- fromInteger <$> getCPUTime
+  action
+  endTime <- fromInteger <$> getCPUTime
+  return (endTime - startTime)
 #ifdef MIN_VERSION_tasty
 #if MIN_VERSION_tasty(1,2,2)
-  WallTime -> round . (1e12 *) <$> getTime
+measureTime WallTime action = do
+  startTime <- round . (1e12 *) <$> getTime
+  action
+  endTime <- round . (1e12 *) <$> getTime
+  return (endTime - startTime)
+#endif
+
+#ifdef MIN_VERSION_libperf
+measureTime CpuCycles action = withPerf HwCpuCycles $ \h -> do
+  perfReset h
+  perfEnable h
+  action
+  perfDisable h
+  perfRead h
+
+measureTime Instructions action = withPerf HwInstructions $ \h -> do
+  perfReset h
+  perfEnable h
+  action
+  perfDisable h
+  perfRead h
 #endif
 #endif
 
 measure :: TimeMode -> Word64 -> Benchmarkable -> IO Measurement
 measure timeMode n (Benchmarkable act) = do
-  let getTimePicoSecs' = getTimePicoSecs timeMode
   performGC
-  startTime <- getTimePicoSecs'
   (startAllocs, startCopied, startMaxMemInUse) <- getAllocsAndCopied
-  act n
-  endTime <- getTimePicoSecs'
+  diffTime <- measureTime timeMode (act n)
   (endAllocs, endCopied, endMaxMemInUse) <- getAllocsAndCopied
   let meas = Measurement
-        { measTime   = endTime - startTime
+        { measTime   = diffTime
         , measAllocs = endAllocs - startAllocs
         , measCopied = endCopied - startCopied
         , measMaxMem = max endMaxMemInUse startMaxMemInUse
@@ -1047,7 +1095,7 @@ measureUntil timeMode warnIfNoTimeout timeout (RelStDev targetRelStDev) b = do
     go n t1 sumOfTs = do
       t2 <- measure' (2 * n) b
 
-      let Estimate (Measurement meanN allocN copiedN maxMemN) stdevN = predictPerturbed t1 t2
+      let Estimate (Measurement meanN allocN copiedN maxMemN) stdevN = predictPerturbed timeMode t1 t2
           isTimeoutSoon = case timeout of
             NoTimeout -> False
             -- multiplying by 12/10 helps to avoid accidental timeouts

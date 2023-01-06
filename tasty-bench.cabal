@@ -44,6 +44,12 @@ flag debug
   description:
     Emit ongoing diagnostic information for benchmarks.
 
+flag libperf
+  default: False
+  manual: True
+  description:
+    Use @libperf@ to count CPU instructions instead of measuring time.
+
 library
   exposed-modules:  Test.Tasty.Bench
   hs-source-dirs:   src
@@ -61,9 +67,12 @@ library
     build-depends:
       containers >= 0.4,
       tasty >= 0.11.3
+    if flag(libperf)
+      build-depends: libperf >=0.1 && <0.2
   if impl(ghc < 7.8)
     build-depends:
       tagged >= 0.2
+
 
   if flag(debug)
     cpp-options: -DDEBUG
